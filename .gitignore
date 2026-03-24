@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.log
+.DS_Store
+
+# Temporary outputs
+shopping_list*
+final_selections.json
+interactive_shopping_list.md
+drizzle_status.txt
+project_status.md

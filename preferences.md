@@ -1,0 +1,9 @@
+- I don't care about organic or BIO. I care about the price (while not compromising on the ingredients list)
+- We slightly prefer the inhouse Rohlik's brands (such as MIIL, etc.) if they are cheaper.
+- We like "Lučina" or "Gervais" for cream cheese.
+- We prefer tomato paste in tube (rohlik's internal brand)
+- We squeeze lemons for getting lemon juice, same for lime juice
+- We do have water at home, so we don't need to buy it
+- We don't distinguish between salt and kosher salt
+- When you see 'unsalted butter', look for 'butter'.
+- We use Sour Cream in place of creme fraiche.

@@ -133,3 +133,33 @@ def filter_pantry_items(ingredients, pantry_path):
             matched.append({"ingredient": ing, "matched_pantry_item": matched_item_name})
             
     return needed, matched
+
+def apply_search_preferences(ingredient_name, preferences_path):
+    """
+    Checks user preferences for explicit 'search instead' rules.
+    Example Rule: '- When you see \'garlic cloves\', search \'garlic\''
+    
+    Args:
+        ingredient_name (str): The original ingredient name.
+        preferences_path (str): Path to the preferences.md file.
+        
+    Returns:
+        str: The mapped search term or the original name if no rule matches.
+    """
+    if not os.path.exists(preferences_path):
+        return ingredient_name
+        
+    import re
+    ing_lower = ingredient_name.lower().strip()
+    
+    with open(preferences_path, "r") as f:
+        for line in f:
+            # Look for patterns like: When you see 'X', search 'Y' or When you see 'X', look for 'Y'
+            match = re.search(r"When you see ['\"](.+?)['\"], (?:search|look for) ['\"](.+?)['\"]", line, re.IGNORECASE)
+            if match:
+                target = match.group(1).lower().strip()
+                replacement = match.group(2).strip()
+                if ing_lower == target:
+                    return replacement
+                    
+    return ingredient_name

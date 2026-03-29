@@ -8,7 +8,7 @@ import time
 import pandas as pd
 from dotenv import load_dotenv
 
-from processor import extract_text_from_pdf, parse_recipe_ingredients, consolidate_ingredients, filter_pantry_items
+from processor import extract_text_from_pdf, parse_recipe_ingredients, consolidate_ingredients, filter_pantry_items, apply_search_preferences
 from agents.mcp_agent import RohlikMCPAgent
 
 # ------------------------------------------------------------------------
@@ -24,6 +24,10 @@ st.set_page_config(page_title="Rohlik Shopping Agent", page_icon="🛒", layout=
 # rate limits or causing unhandled Node.js subprocess errors.
 init_lock = threading.Lock()
 
+# Initialize session state for UI stability
+if 'extraction_summary' not in st.session_state:
+    st.session_state.extraction_summary = None
+
 # ------------------------------------------------------------------------
 # UI Components
 # ------------------------------------------------------------------------
@@ -36,6 +40,10 @@ def render_upload_section():
 
     uploaded_files = st.file_uploader("Choose PDF files", type="pdf", accept_multiple_files=True)
 
+    # Persistent summary display to keep the widget tree stable
+    if st.session_state.extraction_summary:
+        st.info(st.session_state.extraction_summary)
+
     if uploaded_files:
         if len(uploaded_files) > 10:
             st.warning("Please upload a maximum of 10 files. Only the first 10 will be processed.")
@@ -43,81 +51,76 @@ def render_upload_section():
         
         if st.button("Generate Consolidated List"):
             all_recipe_ingredients = []
-            progress_bar = st.progress(0)
             
-            for i, uploaded_file in enumerate(uploaded_files):
-                st.write(f"Processing: **{uploaded_file.name}**...")
-                try:
-                    text = extract_text_from_pdf(uploaded_file)
-                    ingredients = parse_recipe_ingredients(text, api_key)
-                    if ingredients:
-                        all_recipe_ingredients.append(ingredients)
-                        st.success(f"Extracted {len(ingredients)} ingredients from {uploaded_file.name}")
-                    else:
-                        st.error(f"Failed to parse ingredients from {uploaded_file.name}. Ensure it contains a valid recipe.")
-                except Exception as e:
-                    st.error(f"Error reading file {uploaded_file.name}: {e}")
+            # Use a status block for a stable processing UI
+            with st.status("Processing recipes...", expanded=True) as status:
+                for i, uploaded_file in enumerate(uploaded_files):
+                    st.write(f"Reading: **{uploaded_file.name}**...")
+                    try:
+                        text = extract_text_from_pdf(uploaded_file)
+                        ingredients = parse_recipe_ingredients(text, api_key)
+                        if ingredients:
+                            all_recipe_ingredients.append(ingredients)
+                            st.write(f"✅ Extracted {len(ingredients)} ingredients from {uploaded_file.name}")
+                        else:
+                            st.error(f"❌ Failed to parse ingredients from {uploaded_file.name}")
+                    except Exception as e:
+                        st.error(f"❌ Error reading {uploaded_file.name}: {e}")
                 
-                progress_bar.progress((i + 1) / len(uploaded_files))
-                
-            if all_recipe_ingredients:
-                try:
-                    consolidated = consolidate_ingredients(all_recipe_ingredients)
-                    needed, matched = filter_pantry_items(consolidated, pantry_path)
-                    
-                    st.session_state.needed_ingredients = needed
-                    st.session_state.matched_ingredients = matched
-                    st.session_state.pantry_confirmed = False
-                    st.session_state.in_pantry_items = []
-                    # Reset selections if we generate a new list
-                    st.session_state.shopping_list = None 
-                except Exception as e:
-                    st.error(f"Error while consolidating or filtering pantry items: {e}")
-            else:
-                st.error("No ingredients could be parsed from the uploaded files.")
+                if all_recipe_ingredients:
+                    try:
+                        consolidated = consolidate_ingredients(all_recipe_ingredients)
+                        needed, matched = filter_pantry_items(consolidated, pantry_path)
+                        
+                        st.session_state.base_needed = needed
+                        st.session_state.matched = matched
+                        st.session_state.pantry_overrides = {}
+                        st.session_state.shopping_list = None 
+                        st.session_state.selections = {}
+                        
+                        summary = f"Successfully processed {len(all_recipe_ingredients)} recipes! Found {len(consolidated)} unique ingredients."
+                        st.session_state.extraction_summary = summary
+                        status.update(label="Recipes processed!", state="complete", expanded=False)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error while consolidating: {e}")
+                        status.update(label="Processing failed", state="error")
+                else:
+                    st.error("No ingredients could be parsed from the uploaded files.")
+                    status.update(label="Processing failed", state="error")
     else:
         st.info("Please upload at least one PDF recipe to get started.")
 
-def render_pantry_check():
-    """Renders the pantry confirmation UI to ensure the user really has matched items."""
-    if 'matched_ingredients' in st.session_state and not st.session_state.get('pantry_confirmed', True):
-        st.markdown("---")
-        st.subheader("🧐 Pantry Check")
+def render_pantry_match_tab():
+    st.subheader("🧐 Pantry Match")
+    st.write("We found these ingredients in your pantry manifest. Uncheck any items you actually need to buy.")
+    
+    if not st.session_state.matched:
+        st.info("No items matched your pantry. Nothing to review here!")
+        return
+
+    for i, match in enumerate(st.session_state.matched):
+        ing_name = match['ingredient']['name']
+        qty = match['ingredient']['quantity']
+        p_item = match['matched_pantry_item']
         
-        if len(st.session_state.matched_ingredients) > 0:
-            st.write("We found these ingredients in your pantry. Please confirm if you really have them:")
-            with st.form("pantry_check_form"):
-                confirm_results = []
-                for i, match in enumerate(st.session_state.matched_ingredients):
-                    ing_name = match['ingredient']['name']
-                    qty = match['ingredient']['quantity']
-                    p_item = match['matched_pantry_item']
-                    
-                    choice = st.radio(
-                        f"Do you have **{ing_name}** ({qty})? (Matched pantry rule: *{p_item}*)",
-                        options=["Yes, I have it (Skip buying)", "No, I need to buy it"],
-                        key=f"pantry_check_{i}"
-                    )
-                    confirm_results.append((match['ingredient'], choice))
-                
-                submitted = st.form_submit_button("Confirm & Proceed to Sourcing")
-                if submitted:
-                    for ing, choice in confirm_results:
-                        if "No, I need to buy it" in choice:
-                            st.session_state.needed_ingredients.append(ing)
-                        else:
-                            st.session_state.in_pantry_items.append({"Ingredient": ing['name'], "Reason": "In Pantry Manifest (Confirmed)"})
-                    st.session_state.pantry_confirmed = True
-                    st.rerun()
-        else:
-            # If nothing matched, skip automatically
-            st.session_state.pantry_confirmed = True
-            st.rerun()
+        current_val = st.session_state.pantry_overrides.get(ing_name, True)
+        
+        def on_change_pantry(name=ing_name, key=f"pantry_cb_{i}"):
+            st.session_state.pantry_overrides[name] = st.session_state[key]
+            # Reset shopping list when pantry changes so we don't end up with stale data
+            st.session_state.shopping_list = None
+            
+        st.checkbox(
+            f"**{ing_name}** ({qty}) — *Matched rule: {p_item}*",
+            value=current_val,
+            key=f"pantry_cb_{i}",
+            on_change=on_change_pantry
+        )
 
 def _fetch_item_from_rohlik(item: dict) -> dict:
     """Helper method to fetch alternatives for an ingredient safely via Rohlik MCP."""
     with init_lock:
-        # Heavily stagger requests to prevent rate-limits and MCP server crashes
         time.sleep(4.0)
         try:
             agent = RohlikMCPAgent()
@@ -125,30 +128,35 @@ def _fetch_item_from_rohlik(item: dict) -> dict:
             raise RuntimeError(f"Failed to initialize Rohlik agent: {e}")
         
     try:
-        alternatives = agent.find_alternatives(item['name'])
+        # Apply search preferences (e.g., 'garlic cloves' -> 'garlic')
+        # We need the relative path to preferences.md
+        prefs_path = "/Users/radim/personal/rohlik_nyt_agent/preferences.md"
+        search_term = apply_search_preferences(item['name'], prefs_path)
+        alternatives = agent.find_alternatives(search_term)
     except Exception as e:
         raise RuntimeError(f"Agent failed to find alternatives: {e}")
 
     return {
         "ingredient": item['name'],
+        "search_term": search_term, # Keep track of what we actually searched
         "quantity_needed": item['quantity'],
-        "options": alternatives,
-        "selected_index": 0 
+        "options": alternatives
     }
 
-def render_sourcing_section():
-    """Handles displaying the consolidated ingredients and sourcing them from Rohlik."""
-    if 'needed_ingredients' in st.session_state and st.session_state.get('pantry_confirmed', False):
-        needed = st.session_state.needed_ingredients
+def render_rohlik_search_tab():
+    st.subheader("🔍 Rohlik Product Search")
+    needed = st.session_state.effective_needed
+    
+    if not needed:
+        st.success("All ingredients are covered by your pantry!")
+        return
         
-        st.subheader("Consolidated Ingredients (All Recipes)")
-        if not needed:
-            st.success("All ingredients are already in your pantry!")
-            return
-
-        st.info(f"Filtered out items found in `{os.path.basename(pantry_path)}`")
+    needs_fetching = st.session_state.get('shopping_list') is None
+    
+    if needs_fetching:
+        st.info(f"You need to buy {len(needed)} items.")
         
-        # Download button for TXT
+        # Text download output
         txt_output = "🛒 CONSOLIDATED SHOPPING LIST\n\n"
         for item in needed:
             txt_output += f"- {item['name']}: {item['quantity']}\n"
@@ -160,15 +168,11 @@ def render_sourcing_section():
             mime="text/plain"
         )
         
-        if st.session_state.get('shopping_list') is None:
-            st.table(needed)
-            if st.button("Find Products on Rohlik.cz"):
-                shopping_list = []
-                sourcing_bar = st.progress(0)
-                status_text = st.empty()
-                status_text.text("Searching Rohlik for ingredients concurrently (staggering connections incrementally to prevent timeouts)...")
-                
-                # Execute concurrently with robust error handling
+        if st.button("Find Products on Rohlik.cz", use_container_width=True):
+            shopping_list = []
+            
+            # Using st.status to prevent "ghosting" and keep UI clean
+            with st.status("🔍 Sourcing Products from Rohlik.cz...", expanded=True) as status:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
                     futures = {executor.submit(_fetch_item_from_rohlik, item): item for item in needed}
                     for idx, future in enumerate(concurrent.futures.as_completed(futures)):
@@ -176,37 +180,53 @@ def render_sourcing_section():
                         try:
                             result = future.result()
                             shopping_list.append(result)
+                            st.write(f"✅ Fetched: {item_failed['name']}")
                         except Exception as e:
-                            st.error(f"Error fetching product '{item_failed['name']}': {e}")
-                        
-                        sourcing_bar.progress((idx + 1) / len(needed))
+                            st.error(f"❌ Error fetching '{item_failed['name']}': {e}")
                 
-                status_text.text("Sourcing complete!")
                 st.session_state.shopping_list = shopping_list
-                st.rerun()
+                status.update(label=f"Sourced {len(shopping_list)} products!", state="complete", expanded=False)
+                
+            st.rerun()
 
-def render_selection_ui():
-    """Renders the shopping list selection interface and the checkout logic."""
-    if st.session_state.get('shopping_list') is not None:
+    if not needs_fetching:
+        st.success(f"Sourced {len(st.session_state.shopping_list)} products! Select your preferred options.")
+        if st.button("Refetch All Products"):
+            st.session_state.shopping_list = None
+            st.rerun()
+            
         st.markdown("---")
-        st.header("🛍️ Select Your Products")
-        
-        final_selections = []
-        cart_items = []
-        skipped_items_final = list(st.session_state.get('in_pantry_items', []))
-        
         for i, item in enumerate(st.session_state.shopping_list):
-            st.subheader(f"{item['ingredient']} (Needed: {item['quantity_needed']})")
+            title = item['ingredient']
+            if item.get('search_term') and item['search_term'].lower() != item['ingredient'].lower():
+                title += f" (Searched as: **{item['search_term']}**)"
+            
+            st.markdown(f"#### {title} (Needed: {item['quantity_needed']})")
             
             options = item.get('options', [])
             if not options:
                 st.warning("No alternatives found.")
                 
-                encoded_ingredient = urllib.parse.quote(item['ingredient'] + " ")
+                # Add a refetch button for single items
+                if st.button(f"🔄 Refetch {item['ingredient']}", key=f"refetch_{i}"):
+                    with st.spinner(f"Refetching {item['ingredient']}..."):
+                        try:
+                            fetch_arg = {"name": item["ingredient"], "quantity": item["quantity_needed"]}
+                            # Re-fetch the item
+                            new_data = _fetch_item_from_rohlik(fetch_arg)
+                            # Update the shopping list
+                            st.session_state.shopping_list[i] = new_data
+                            # Reset selection value safely
+                            st.session_state.selections[item['ingredient']] = 0
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed to refetch: {e}")
+                
+                search_name = item.get('search_term', item['ingredient'])
+                encoded_ingredient = urllib.parse.quote(search_name + " ")
                 search_url = f"https://www.rohlik.cz/en-CZ/hledat?q={encoded_ingredient}&companyId=1"
                 st.markdown(f"[View Search on Rohlik]({search_url})")
-                
-                skipped_items_final.append({"Ingredient": item['ingredient'], "Reason": "Nothing Found on Rohlik"})
+                st.session_state.selections[item['ingredient']] = -1 # Special code for skipped
                 st.markdown("---")
                 continue
                 
@@ -221,107 +241,159 @@ def render_selection_ui():
             SKIP_OPTION = "🚫 Don't add anything"
             formatted_options.append(SKIP_OPTION)
                 
-            default_idx = min(item.get('selected_index', 0), len(options))
+            current_idx = st.session_state.selections.get(item['ingredient'], 0)
+            if current_idx == -1: 
+                current_idx = len(formatted_options) - 1 # Map -1 to SKIP_OPTION
+
+            def on_change_selection(ing=item['ingredient'], key=f"radio_{i}", opts=formatted_options):
+                if key not in st.session_state:
+                    return
+                sel_str = st.session_state[key]
+                if sel_str == SKIP_OPTION:
+                    st.session_state.selections[ing] = -1
+                else:
+                    try:
+                        st.session_state.selections[ing] = opts.index(sel_str)
+                    except ValueError:
+                        # This can happen if the options changed between re-runs
+                        # We'll default to the first option if it's completely out of sync
+                        st.session_state.selections[ing] = 0
             
             selected_str = st.radio(
                 "Choose an option:",
                 options=formatted_options,
-                index=default_idx,
+                index=current_idx,
                 key=f"radio_{i}",
-                label_visibility="collapsed"
+                label_visibility="collapsed",
+                on_change=on_change_selection
             )
             
-            selected_idx = formatted_options.index(selected_str)
-            st.session_state.shopping_list[i]['selected_index'] = selected_idx
-            
-            if selected_str == SKIP_OPTION:
-                st.markdown("*Skipping this item.*")
-                st.markdown("---")
-                skipped_items_final.append({"Ingredient": item['ingredient'], "Reason": "Skipped ('Don't add anything')"})
-                continue
-                
-            selected_option = options[selected_idx]
-            
-            encoded_ingredient = urllib.parse.quote(item['ingredient'] + " ")
+            # Use search_term for the link if available
+            search_name = item.get('search_term', item['ingredient'])
+            encoded_ingredient = urllib.parse.quote(search_name + " ")
             search_url = f"https://www.rohlik.cz/en-CZ/hledat?q={encoded_ingredient}&companyId=1"
-            
-            final_selections.append({
-                "ingredient": item['ingredient'],
-                "quantity": item['quantity_needed'],
-                "product_name": selected_option.get('name'),
-                "product_id": selected_option.get('product_id'),
-                "package_size": selected_option.get('package_size'),
-                "price": selected_option.get('price'),
-                "url": search_url
-            })
-            
-            prod_id = selected_option.get('product_id')
-            if prod_id:
-                cart_items.append({
-                    "productId": int(prod_id),
-                    "quantity": 1 # Defaulting to 1 for automated cart
-                })
-            
             st.markdown(f"[View on Rohlik]({search_url})")
             st.markdown("---")
+
+def render_cart_summary_tab():
+    st.subheader("🛒 Final Cart SUMMARY")
+    if st.session_state.get('shopping_list') is None:
+        st.info("Fetch products in the 'Rohlik Search' tab first.")
+        return
         
-        # --------------------------------------------------------------------
-        # Checkout Sequence
-        # --------------------------------------------------------------------
-        st.header("Total Summary")
-        try:
-            total_price = sum(float(str(sel.get('price', 0)).replace(',','').replace('Kč','').strip() or 0) for sel in final_selections)
-        except Exception:
-            total_price = 0.0
+    final_selections = []
+    cart_items = []
+    skipped_items_final = []
+    
+    for item in st.session_state.shopping_list:
+        ing = item['ingredient']
+        sel_idx = st.session_state.selections.get(ing, 0)
+        options = item.get('options', [])
+        
+        if not options or sel_idx == -1:
+            skipped_items_final.append({"Ingredient": ing, "Reason": "Nothing found" if not options else "Skipped"})
+            continue
             
-        st.subheader(f"Estimated Total: {total_price:.2f} Kč")
+        selected_option = options[sel_idx]
+        search_name = item.get('search_term', ing)
+        encoded_ingredient = urllib.parse.quote(search_name + " ")
+        search_url = f"https://www.rohlik.cz/en-CZ/hledat?q={encoded_ingredient}&companyId=1"
         
-        if st.button("🛒 Add to basket"):
-            if not cart_items:
-                st.warning("No items selected to add to the basket.")
-            else:
-                with st.spinner("Adding items to your Rohlik.cz basket..."):
-                    try:
-                        cart_agent = RohlikMCPAgent()
-                        result = cart_agent.add_items_to_basket(cart_items)
+        final_selections.append({
+            "ingredient": ing,
+            "quantity": item['quantity_needed'],
+            "product_name": selected_option.get('name'),
+            "product_id": selected_option.get('product_id'),
+            "package_size": selected_option.get('package_size'),
+            "price": selected_option.get('price'),
+            "price_per_unit": selected_option.get('price_per_unit'),
+            "url": search_url
+        })
+        
+        prod_id = selected_option.get('product_id')
+        if prod_id:
+            cart_items.append({
+                "productId": int(prod_id),
+                "quantity": 1
+            })
+            
+    try:
+        total_price = sum(float(str(sel.get('price', 0)).replace(',','').replace('Kč','').strip() or 0) for sel in final_selections)
+    except Exception:
+        total_price = 0.0
+        
+    st.markdown(f"### Estimated Total: {total_price:.2f} Kč")
+    
+    if st.button("🛒 Add to basket", use_container_width=True):
+        if not cart_items:
+            st.warning("No items selected to add to the basket.")
+        else:
+            with st.spinner("Adding items to your Rohlik.cz basket..."):
+                try:
+                    cart_agent = RohlikMCPAgent()
+                    result = cart_agent.add_items_to_basket(cart_items)
+                    
+                    st.success("Successfully added selected items to your Rohlik basket!")
+                    with st.expander("View Agent Output"):
+                        st.code(result)
                         
-                        st.success("Successfully added selected items to your Rohlik basket!")
-                        with st.expander("View Agent Output"):
-                            st.code(result)
-                            
-                        # Save state for future runs or verification
-                        out_path_json = "/Users/radim/personal/rohlik_nyt_agent/final_selections.json"
-                        with open(out_path_json, "w") as f:
-                            json.dump(final_selections, f, indent=2, ensure_ascii=False)
-                        
-                        out_path_md = "/Users/radim/personal/rohlik_nyt_agent/interactive_shopping_list.md"
-                        with open(out_path_md, "w") as f:
-                            f.write("# 🛒 Final Interactive Shopping List\n\n")
-                            for sel in final_selections:
-                                f.write(f"* **{sel['ingredient']}** ({sel['quantity']}): [{sel['product_name']}]({sel['url']}) - **{sel['price']} Kč**\n")
-                            f.write(f"\n**Total: {total_price:.2f} Kč**\n")
-                        
-                        st.balloons()
-                    except Exception as e:
-                        st.error(f"A critical error occurred while adding items to the basket: {e}")
-                        st.info("Please check the console logs for more information.")
+                    out_path_json = "/Users/radim/personal/rohlik_nyt_agent/final_selections.json"
+                    with open(out_path_json, "w") as f:
+                        json.dump(final_selections, f, indent=2, ensure_ascii=False)
+                    
+                    st.balloons()
+                except Exception as e:
+                    st.error(f"A critical error occurred while adding items to the basket: {e}")
+                    
+    st.markdown("---")
+    st.markdown("#### Items to Buy")
+    if final_selections:
+        df_buy = pd.DataFrame(final_selections)
+        st.table(df_buy[['ingredient', 'quantity', 'product_name', 'price', 'price_per_unit']])
+    else:
+        st.info("No items selected.")
+        
+    st.markdown("#### Items Skipped / Ignored")
+    val_skipped = list(skipped_items_final)
+    # Also include items ignored from Pantry
+    if 'matched' in st.session_state:
+        for m in st.session_state.matched:
+            ing_name = m['ingredient']['name']
+            if st.session_state.pantry_overrides.get(ing_name, True):
+                val_skipped.append({"Ingredient": ing_name, "Reason": f"In Pantry (Rule: {m['matched_pantry_item']})"})
                 
-                st.markdown("---")
-                st.header("📋 Items Excluded from Basket")
-                if skipped_items_final:
-                    df_skipped = pd.DataFrame(skipped_items_final)
-                    st.table(df_skipped)
-                else:
-                    st.info("No items were excluded! Everything from the recipes was added to your cart.")
+    if val_skipped:
+        df_skipped = pd.DataFrame(val_skipped)
+        st.table(df_skipped)
 
 # ------------------------------------------------------------------------
 # Main Application Flow
 # ------------------------------------------------------------------------
 def main():
     render_upload_section()
-    render_pantry_check()
-    render_sourcing_section()
-    render_selection_ui()
+    
+    if 'base_needed' in st.session_state and 'matched' in st.session_state:
+        # Compute effective needed
+        effective_needed = list(st.session_state.base_needed)
+        for m in st.session_state.matched:
+            ing_name = m['ingredient']['name']
+            has_it = st.session_state.pantry_overrides.get(ing_name, True)
+            if not has_it:
+                effective_needed.append(m['ingredient'])
+                
+        st.session_state.effective_needed = effective_needed
+        
+        st.markdown("---")
+        tab1, tab2, tab3 = st.tabs(["📋 Pantry Match", "🔍 Rohlik Search", "🛒 Final Cart SUMMARY"])
+        
+        with tab1:
+            render_pantry_match_tab()
+            
+        with tab2:
+            render_rohlik_search_tab()
+            
+        with tab3:
+            render_cart_summary_tab()
 
 if __name__ == "__main__":
     main()

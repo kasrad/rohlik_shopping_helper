@@ -7,3 +7,4 @@
 - We don't distinguish between salt and kosher salt
 - When you see 'unsalted butter', look for 'butter'.
 - We use Sour Cream in place of creme fraiche.
+- When you see 'garlic cloves', search 'garlic'

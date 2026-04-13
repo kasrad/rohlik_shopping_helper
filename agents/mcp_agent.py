@@ -1,64 +1,121 @@
 import os
 import json
+import asyncio
 from dotenv import load_dotenv
-load_dotenv("/Users/radim/personal/rohlik_nyt_agent/.env")
+import anthropic
+from mcp import StdioServerParameters, ClientSession
+from mcp.client.stdio import stdio_client
 
-from google.adk.agents import Agent
-from google.adk.tools import McpToolset
-from mcp import StdioServerParameters
+from config import ENV_PATH, PREFERENCES_PATH, NPX_PATH
 
-class RohlikMCPAgent(Agent):
+load_dotenv(ENV_PATH)
+
+
+class RohlikMCPAgent:
     """
     Agent that uses the Rohlik MCP Server to search for products.
+    Uses Claude via the Anthropic SDK with a manual MCP agentic loop.
     """
-    def __init__(self, model="gemini-2.5-flash"):
-        
+
+    def __init__(self, model="claude-haiku-4-5-20251001", prefs_path=PREFERENCES_PATH):
+        self.model = model
+        self.client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
         email = os.environ.get("RHL_EMAIL")
         password = os.environ.get("RHL_PASS")
-        
-        # Use absolute path to the stable npx we just installed
-        npx_path = "/usr/local/bin/npx"
-        
-        params = StdioServerParameters(
-            command=npx_path,
+
+        self.server_params = StdioServerParameters(
+            command=NPX_PATH,
             args=[
                 "-y", "mcp-remote",
                 "https://mcp.rohlik.cz/mcp",
                 "--header", f"rhl-email: {email}",
-                "--header", f"rhl-pass: {password}"
+                "--header", f"rhl-pass: {password}",
             ]
         )
 
-        mcp_toolset = McpToolset(connection_params=params)
-
-        super().__init__(
-            name="RohlikMCPAgent",
-            instruction=(
-                "You are an expert personal shopper for Rohlik.cz (Czech Republic). "
-                "To find products, you MUST use the `batch_search_products` tool. "
-                "IMPORTANT: You must provide keywords in CZECH (e.g., 'máslo' instead of 'butter'). "
-                "User Preferences: Prioritize PRICE (cheapest quality options). "
-                "Prefer in-house brands like 'Miil', 'Modrosladké', 'Pappudia', 'Ubomi', 'Dacello', 'FJORU', 'Kitchin', 'Yutto'. "
-                "Do NOT prioritize Organic/BIO unless it is the cheapest option. "
-                "Avoid Tesco Value and Albert Quality brands. "
-                "Always return the 3 best options with prices and ensure the best price-to-quality ratio."
-            ),
-            tools=[mcp_toolset],
-            model=model
-        )
-
-    def find_alternatives(self, ingredient: str) -> str:
-        """Searches Rohlik for real product alternatives for an ingredient."""
-        # Read preferences if available
         prefs = ""
-        prefs_path = "/Users/radim/personal/rohlik_nyt_agent/preferences.md"
         if os.path.exists(prefs_path):
             with open(prefs_path, "r") as f:
                 prefs = f.read()
 
+        self.instruction = (
+            "You are an expert personal shopper for Rohlik.cz (Czech Republic). "
+            "To find products, you MUST use the `batch_search_products` tool. "
+            "IMPORTANT: You must provide keywords in CZECH (e.g., 'máslo' instead of 'butter'). "
+            "Always return the 3 best options with prices and ensure the best price-to-quality ratio.\n\n"
+            f"User preferences:\n{prefs}"
+        )
+
+    async def _run_agent(self, prompt: str) -> str:
+        """Runs an agentic loop: connects to Rohlik MCP, passes tools to Claude."""
+        async with stdio_client(self.server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+
+                # Discover tools from the MCP server
+                tools_result = await session.list_tools()
+                tools = [
+                    {
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "input_schema": tool.inputSchema,
+                    }
+                    for tool in tools_result.tools
+                ]
+
+                messages = [{"role": "user", "content": prompt}]
+
+                while True:
+                    response = self.client.messages.create(
+                        model=self.model,
+                        max_tokens=4096,
+                        system=self.instruction,
+                        tools=tools,
+                        messages=messages,
+                    )
+
+                    if response.stop_reason == "end_turn":
+                        text_parts = [b.text for b in response.content if hasattr(b, "text")]
+                        return "\n".join(text_parts)
+
+                    if response.stop_reason == "tool_use":
+                        messages.append({"role": "assistant", "content": response.content})
+
+                        tool_results = []
+                        for block in response.content:
+                            if block.type != "tool_use":
+                                continue
+                            try:
+                                result = await session.call_tool(block.name, block.input)
+                                content_parts = [
+                                    c.text if hasattr(c, "text") else str(c)
+                                    for c in result.content
+                                ]
+                                content = "\n".join(content_parts)
+                            except Exception as e:
+                                content = f"Tool error: {e}"
+
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": content,
+                            })
+
+                        messages.append({"role": "user", "content": tool_results})
+                    else:
+                        # Unexpected stop reason — return whatever text we have
+                        text_parts = [b.text for b in response.content if hasattr(b, "text")]
+                        return "\n".join(text_parts)
+
+    def _run(self, prompt: str) -> str:
+        """Bridge async _run_agent to a synchronous call."""
+        return asyncio.run(self._run_agent(prompt))
+
+    def find_alternatives(self, ingredient: str) -> list:
+        """Searches Rohlik for real product alternatives for an ingredient."""
         prompt = (
             f"Find 3 options for the ingredient: '{ingredient}'.\n\n"
-            f"User Preferences:\n{prefs}\n"
             "Return EXACTLY a raw JSON array of 3 objects, without any markdown formatting wrappers like ```json. "
             "Each object MUST have the following keys:\n"
             "- name: (str) Exact name of the product\n"
@@ -68,31 +125,19 @@ class RohlikMCPAgent(Agent):
             "- price_per_unit: (str) Price per unit (e.g., '219.60 Kč/kg' or 'N/A' if unavailable)\n"
             "- image_url: (str) The URL to the product's image (if available in the data, else an empty string)\n"
         )
-        from google.adk import Runner
-        from google.adk.sessions.in_memory_session_service import InMemorySessionService
-        from google.genai import types
 
-        runner = Runner(agent=self, app_name="rohlik_nyt", session_service=InMemorySessionService(), auto_create_session=True)
-        msg = types.Content(parts=[types.Part.from_text(text=prompt)])
-        
-        out = ""
         try:
-            for event in runner.run(user_id="local", session_id="real_mcp_search", new_message=msg):
-                if event.content and event.content.parts:
-                    for p in event.content.parts:
-                        if p.text:
-                            out += p.text
+            out = self._run(prompt)
         except Exception as e:
-            print(f"Agent session run failed during find_alternatives: {e}")
+            print(f"Agent run failed during find_alternatives: {e}")
             return []
-        
-        # Clean up markdown if the LLM adds it despite instructions
+
         out = out.strip()
         if out.startswith("```json"):
-            out = out[7:-3].strip()
+            out = out[7:].rstrip("`").strip()
         elif out.startswith("```"):
-            out = out[3:-3].strip()
-            
+            out = out[3:].rstrip("`").strip()
+
         try:
             return json.loads(out)
         except Exception as e:
@@ -109,30 +154,17 @@ class RohlikMCPAgent(Agent):
             f"{json.dumps(items, indent=2)}\n"
             "Respond with a success message once added."
         )
-        
-        from google.adk import Runner
-        from google.adk.sessions.in_memory_session_service import InMemorySessionService
-        from google.genai import types
 
-        runner = Runner(agent=self, app_name="rohlik_nyt", session_service=InMemorySessionService(), auto_create_session=True)
-        msg = types.Content(parts=[types.Part.from_text(text=prompt)])
-        
-        out = ""
         try:
-            for event in runner.run(user_id="local", session_id="real_mcp_cart", new_message=msg):
-                if event.content and event.content.parts:
-                    for p in event.content.parts:
-                        if p.text:
-                            out += p.text
+            return self._run(prompt)
         except Exception as e:
-            err_msg = f"Agent session run failed during add_items_to_basket: {e}"
+            err_msg = f"Agent run failed during add_items_to_basket: {e}"
             print(err_msg)
             return err_msg
-            
-        return out
+
 
 if __name__ == "__main__":
     agent = RohlikMCPAgent()
-    print("--- Rohlik MCP Real Search JSON Test ---")
+    print("--- Rohlik MCP Claude Search Test ---")
     result = agent.find_alternatives("máslo")
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2, ensure_ascii=False))

@@ -1,7 +1,7 @@
-import os
 import json
+import re
 from pypdf import PdfReader
-from google import genai
+import anthropic
 
 def extract_text_from_pdf(pdf_source):
     """
@@ -26,38 +26,71 @@ def extract_text_from_pdf(pdf_source):
 def parse_recipe_ingredients(recipe_text, api_key):
     """
     Uses the Gemini LLM to parse raw recipe text into a structured JSON list of ingredients.
-    
+
     Args:
         recipe_text (str): The raw text extracted from a recipe document.
         api_key (str): The API key for Gemini.
-        
+
     Returns:
-        list: A list of dicts, each with 'name' and 'quantity' keys. Returns an empty list on failure. 
+        list: A list of dicts, each with 'name' and 'quantity' keys.
+
+    Raises:
+        ValueError: If the PDF appears to contain no extractable text.
+        RuntimeError: If the Gemini API call or JSON parsing fails.
     """
+    if not recipe_text or not recipe_text.strip():
+        raise ValueError(
+            "No text could be extracted from this PDF. "
+            "It may be a scanned image rather than a text-based PDF."
+        )
+
+    client = anthropic.Anthropic(api_key=api_key)
+    prompt = (
+        "Extract a JSON list of ingredients from the following recipe text. "
+        "Include name and quantity for each. "
+        "Return ONLY a raw JSON array of objects with keys 'name' and 'quantity'.\n\n"
+        f"Recipe Text:\n{recipe_text}"
+    )
+
     try:
-        client = genai.Client(api_key=api_key, http_options={'api_version': 'v1beta'})
-        prompt = (
-            "Extract a JSON list of ingredients from the following recipe text. "
-            "Include name and quantity for each. "
-            "Return ONLY a raw JSON array of objects with keys 'name' and 'quantity'.\n\n"
-            f"Recipe Text:\n{recipe_text}"
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}]
         )
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
-        
-        text_out = response.text.strip()
-        # Clean up markdown code blocks if the LLM includes them
-        if text_out.startswith("```json"):
-            text_out = text_out[7:-3].strip()
-        elif text_out.startswith("```"):
-            text_out = text_out[3:-3].strip()
-        
-        return json.loads(text_out)
     except Exception as e:
-        print(f"Error communicating with Gemini or parsing JSON output: {e}")
-        return []
+        raise RuntimeError(f"Claude API call failed: {e}") from e
+
+    text_out = response.content[0].text if response.content else None
+    if not text_out:
+        raise RuntimeError(
+            "Claude returned an empty response. "
+            "The model may have hit a safety filter or a rate limit."
+        )
+
+    text_out = text_out.strip()
+    if text_out.startswith("```json"):
+        text_out = text_out[7:].rstrip("`").strip()
+    elif text_out.startswith("```"):
+        text_out = text_out[3:].rstrip("`").strip()
+
+    # Direct parse
+    try:
+        return json.loads(text_out)
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: find a JSON array anywhere in the response
+    match = re.search(r'\[.*\]', text_out, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+
+    raise RuntimeError(
+        f"Could not parse Gemini response as JSON.\nResponse was: {text_out[:300]}"
+    )
 
 def consolidate_ingredients(recipe_ingredient_lists):
     """
@@ -93,73 +126,3 @@ def consolidate_ingredients(recipe_ingredient_lists):
                 
     return list(consolidated.values())
 
-def filter_pantry_items(ingredients, pantry_path):
-    """
-    Filters out ingredients that are already present in the user's pantry manifest.
-    
-    Args:
-        ingredients (list): Standard list of needed ingredients via parses.
-        pantry_path (str): The file path to the user's markdown pantry manifest.
-        
-    Returns:
-        tuple: (needed_ingredients, matched_ingredients_for_confirmation)
-    """
-    if not os.path.exists(pantry_path):
-        return ingredients, []
-    
-    with open(pantry_path, "r") as f:
-        # Assumes pantry manifest is a markdown list: - item name
-        pantry_items = [line.strip("- ").lower().strip() for line in f if line.strip().startswith("-")]
-    
-    import re
-    needed = []
-    matched = []
-    for ing in ingredients:
-        ing_name = ing['name'].lower().strip()
-        match_found = False
-        matched_item_name = ""
-        
-        for p_item in pantry_items:
-            if not p_item: continue
-            # Use word boundaries so "salt" matches "kosher salt" but "water" doesn't match "watermelon"
-            if re.search(r'\b' + re.escape(p_item) + r'\b', ing_name):
-                match_found = True
-                matched_item_name = p_item
-                break
-                
-        if not match_found:
-            needed.append(ing)
-        else:
-            matched.append({"ingredient": ing, "matched_pantry_item": matched_item_name})
-            
-    return needed, matched
-
-def apply_search_preferences(ingredient_name, preferences_path):
-    """
-    Checks user preferences for explicit 'search instead' rules.
-    Example Rule: '- When you see \'garlic cloves\', search \'garlic\''
-    
-    Args:
-        ingredient_name (str): The original ingredient name.
-        preferences_path (str): Path to the preferences.md file.
-        
-    Returns:
-        str: The mapped search term or the original name if no rule matches.
-    """
-    if not os.path.exists(preferences_path):
-        return ingredient_name
-        
-    import re
-    ing_lower = ingredient_name.lower().strip()
-    
-    with open(preferences_path, "r") as f:
-        for line in f:
-            # Look for patterns like: When you see 'X', search 'Y' or When you see 'X', look for 'Y'
-            match = re.search(r"When you see ['\"](.+?)['\"], (?:search|look for) ['\"](.+?)['\"]", line, re.IGNORECASE)
-            if match:
-                target = match.group(1).lower().strip()
-                replacement = match.group(2).strip()
-                if ing_lower == target:
-                    return replacement
-                    
-    return ingredient_name

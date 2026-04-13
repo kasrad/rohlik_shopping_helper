@@ -2,84 +2,23 @@ import streamlit as st
 import os
 import urllib.parse
 import json
-import math
-import re
 import concurrent.futures
-import threading
-import time
 import pandas as pd
 from dotenv import load_dotenv
 
-from processor import extract_text_from_pdf, parse_recipe_ingredients, consolidate_ingredients, filter_pantry_items, apply_search_preferences
+from config import ENV_PATH, PANTRY_PATH, ROOT
+from processor import extract_text_from_pdf, parse_recipe_ingredients, consolidate_ingredients
+from pantry import filter_pantry_items
+from shopping import fetch_item_from_rohlik, _auto_suggest_quantity
 from agents.mcp_agent import RohlikMCPAgent
-
-# ------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------
-
-def _auto_suggest_quantity(ingredient_qty_str: str, package_size_str: str, product_name_str: str = "") -> int:
-    """
-    Estimate how many packs to buy using a 15% underage tolerance:
-    - Try floor(needed / pack). If it covers ≥ 85% of what's needed, use it.
-    - Otherwise use ceil (never leave more than 15% uncovered).
-    Parses weight/volume from package_size_str, falling back to product_name_str.
-    Sums all quantities in the ingredient string (e.g. "200g + 595g" → 795g).
-    Falls back to 1 for incompatible or unparseable units.
-    """
-    UNIT_FACTORS = {
-        'kg': 1000, 'kilogram': 1000, 'kilograms': 1000,
-        'g': 1,  'gram': 1,     'grams': 1,
-        'l': 1000, 'liter': 1000, 'liters': 1000, 'litre': 1000, 'litres': 1000,
-        'ml': 1, 'milliliter': 1, 'milliliters': 1, 'millilitre': 1, 'millilitres': 1,
-    }
-    WEIGHT_UNITS = {'kg', 'kilogram', 'kilograms', 'g', 'gram', 'grams'}
-    TOLERANCE = 0.85  # must cover at least 85% of needed quantity
-
-    _unit_pat = r'(kilogram(?:s)?|kg|gram(?:s)?|g|millilitre(?:s)?|milliliter(?:s)?|ml|litre(?:s)?|liter(?:s)?|l)'
-
-    def parse_total(s: str):
-        """Find all weight/volume quantities in s and return their sum in base units."""
-        s = s.lower().replace(',', '.')
-        matches = re.findall(rf'([\d.]+)[\s-]*{_unit_pat}\b', s)
-        if not matches:
-            return None
-        weight, volume = 0.0, 0.0
-        for num_str, unit in matches:
-            val = float(num_str) * UNIT_FACTORS[unit]
-            if unit in WEIGHT_UNITS:
-                weight += val
-            else:
-                volume += val
-        if weight > 0 and volume == 0:
-            return weight, 'weight'
-        if volume > 0 and weight == 0:
-            return volume, 'volume'
-        return None  # mixed units — can't reliably sum
-
-    ing = parse_total(ingredient_qty_str)
-    pkg = parse_total(package_size_str) or parse_total(product_name_str)
-
-    if ing and pkg and ing[1] == pkg[1] and pkg[0] > 0:
-        needed, pack = ing[0], pkg[0]
-        n_floor = max(1, math.floor(needed / pack))
-        if n_floor * pack >= needed * TOLERANCE:
-            return n_floor
-        return math.ceil(needed / pack)
-    return 1
-
 
 # ------------------------------------------------------------------------
 # Initialization & Setup
 # ------------------------------------------------------------------------
-load_dotenv("/Users/radim/personal/rohlik_nyt_agent/.env")
-api_key = os.environ.get("GEMINI_API_KEY")
-pantry_path = "/Users/radim/personal/rohlik_nyt_agent/pantry_manifest.md"
+load_dotenv(ENV_PATH)
+api_key = os.environ.get("ANTHROPIC_API_KEY")
 
 st.set_page_config(page_title="Rohlik Shopping Agent", page_icon="🛒", layout="wide")
-
-# We use a lock for thread-safe MCP agent initialization to avoid hitting
-# rate limits or causing unhandled Node.js subprocess errors.
-init_lock = threading.Lock()
 
 # Initialize session state for UI stability
 if 'extraction_summary' not in st.session_state:
@@ -93,8 +32,17 @@ if 'quantities' not in st.session_state:
 
 def render_upload_section():
     """Handles PDF file uploads and processes them to extract ingredients."""
-    st.title("🛒 Rohlik Shopping Agent")
-    st.markdown("### Iteration 2: Multi-PDF Recipe Consolidation")
+    col_title, col_reset = st.columns([6, 1])
+    with col_title:
+        st.title("🛒 Rohlik Shopping Agent")
+    with col_reset:
+        if 'base_needed' in st.session_state:
+            st.write("")  # vertical alignment nudge
+            if st.button("↩ Start Over", type="secondary", use_container_width=True):
+                for key in ['base_needed', 'matched', 'pantry_overrides', 'shopping_list',
+                            'selections', 'quantities', 'extraction_summary', 'effective_needed']:
+                    st.session_state.pop(key, None)
+                st.rerun()
     st.write("Upload up to 10 recipe PDFs to generate a consolidated shopping list.")
 
     uploaded_files = st.file_uploader("Choose PDF files", type="pdf", accept_multiple_files=True)
@@ -129,7 +77,7 @@ def render_upload_section():
                 if all_recipe_ingredients:
                     try:
                         consolidated = consolidate_ingredients(all_recipe_ingredients)
-                        needed, matched = filter_pantry_items(consolidated, pantry_path)
+                        needed, matched = filter_pantry_items(consolidated)
                         
                         st.session_state.base_needed = needed
                         st.session_state.matched = matched
@@ -178,30 +126,6 @@ def render_pantry_match_tab():
             on_change=on_change_pantry
         )
 
-def _fetch_item_from_rohlik(item: dict) -> dict:
-    """Helper method to fetch alternatives for an ingredient safely via Rohlik MCP."""
-    with init_lock:
-        time.sleep(4.0)
-        try:
-            agent = RohlikMCPAgent()
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize Rohlik agent: {e}")
-        
-    try:
-        # Apply search preferences (e.g., 'garlic cloves' -> 'garlic')
-        # We need the relative path to preferences.md
-        prefs_path = "/Users/radim/personal/rohlik_nyt_agent/preferences.md"
-        search_term = apply_search_preferences(item['name'], prefs_path)
-        alternatives = agent.find_alternatives(search_term)
-    except Exception as e:
-        raise RuntimeError(f"Agent failed to find alternatives: {e}")
-
-    return {
-        "ingredient": item['name'],
-        "search_term": search_term, # Keep track of what we actually searched
-        "quantity_needed": item['quantity'],
-        "options": alternatives
-    }
 
 def render_rohlik_search_tab():
     st.subheader("🔍 Rohlik Product Search")
@@ -236,7 +160,7 @@ def render_rohlik_search_tab():
                 total = len(needed)
                 progress_bar = st.progress(0, text=f"0 / {total} products fetched")
                 with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                    futures = {executor.submit(_fetch_item_from_rohlik, item): item for item in needed}
+                    futures = {executor.submit(fetch_item_from_rohlik, item): item for item in needed}
                     for idx, future in enumerate(concurrent.futures.as_completed(futures)):
                         item_failed = futures[future]
                         try:
@@ -262,10 +186,17 @@ def render_rohlik_search_tab():
         st.markdown("---")
         for i, item in enumerate(st.session_state.shopping_list):
             title = item['ingredient']
-            if item.get('search_term') and item['search_term'].lower() != item['ingredient'].lower():
-                title += f" (Searched as: **{item['search_term']}**)"
-            
-            st.markdown(f"#### {title} (Needed: {item['quantity_needed']})")
+            search_term = item.get('search_term', '')
+            qty_needed = item['quantity_needed']
+            if search_term and search_term.lower() != title.lower():
+                tooltip = f'<span title="Searched on Rohlik as: {search_term}" style="cursor:help;font-size:0.8em;">ℹ️</span>'
+            else:
+                tooltip = ''
+
+            st.markdown(
+                f'#### {title} {tooltip} <span style="font-size:0.75em;color:grey;">(Need: {qty_needed})</span>',
+                unsafe_allow_html=True,
+            )
             
             options = item.get('options', [])
             if not options:
@@ -276,7 +207,7 @@ def render_rohlik_search_tab():
                     with st.spinner(f"Refetching {item['ingredient']}..."):
                         try:
                             fetch_arg = {"name": item["ingredient"], "quantity": item["quantity_needed"]}
-                            new_data = _fetch_item_from_rohlik(fetch_arg)
+                            new_data = fetch_item_from_rohlik(fetch_arg)
                             st.session_state.shopping_list[i] = new_data
                             st.session_state.selections[item['ingredient']] = 0
                             st.session_state.quantities.pop(item['ingredient'], None)
@@ -379,7 +310,7 @@ def render_rohlik_search_tab():
             st.markdown("---")
 
 def render_cart_summary_tab():
-    st.subheader("🛒 Final Cart SUMMARY")
+    st.subheader("🛒 Cart Summary")
     if st.session_state.get('shopping_list') is None:
         st.info("Fetch products in the 'Rohlik Search' tab first.")
         return
@@ -430,37 +361,13 @@ def render_cart_summary_tab():
     except Exception:
         total_price = 0.0
         
-    st.markdown(f"### Estimated Total: {total_price:.2f} Kč")
-    
-    if st.button("🛒 Add to basket", use_container_width=True):
-        if not cart_items:
-            st.warning("No items selected to add to the basket.")
-        else:
-            with st.spinner("Adding items to your Rohlik.cz basket..."):
-                try:
-                    cart_agent = RohlikMCPAgent()
-                    result = cart_agent.add_items_to_basket(cart_items)
-                    
-                    st.success("Successfully added selected items to your Rohlik basket!")
-                    with st.expander("View Agent Output"):
-                        st.code(result)
-                        
-                    out_path_json = "/Users/radim/personal/rohlik_nyt_agent/final_selections.json"
-                    with open(out_path_json, "w") as f:
-                        json.dump(final_selections, f, indent=2, ensure_ascii=False)
-                    
-                    st.balloons()
-                except Exception as e:
-                    st.error(f"A critical error occurred while adding items to the basket: {e}")
-                    
-    st.markdown("---")
     st.markdown("#### Items to Buy")
     if final_selections:
         df_buy = pd.DataFrame(final_selections)
         st.table(df_buy[['ingredient', 'quantity_needed', 'packs', 'product_name', 'package_size', 'price', 'price_per_unit']])
     else:
         st.info("No items selected.")
-        
+
     st.markdown("#### Items Skipped / Ignored")
     val_skipped = list(skipped_items_final)
     # Also include items ignored from Pantry
@@ -469,10 +376,34 @@ def render_cart_summary_tab():
             ing_name = m['ingredient']['name']
             if st.session_state.pantry_overrides.get(ing_name, True):
                 val_skipped.append({"Ingredient": ing_name, "Reason": f"In Pantry (Rule: {m['matched_pantry_item']})"})
-                
+
     if val_skipped:
         df_skipped = pd.DataFrame(val_skipped)
         st.table(df_skipped)
+
+    st.markdown("---")
+    st.markdown(f"### Estimated Total: {total_price:.2f} Kč")
+
+    if st.button("🛒 Add to basket", use_container_width=True):
+        if not cart_items:
+            st.warning("No items selected to add to the basket.")
+        else:
+            with st.spinner("Adding items to your Rohlik.cz basket..."):
+                try:
+                    cart_agent = RohlikMCPAgent()
+                    result = cart_agent.add_items_to_basket(cart_items)
+
+                    st.success("Successfully added selected items to your Rohlik basket!")
+                    with st.expander("View Agent Output"):
+                        st.code(result)
+
+                    out_path_json = ROOT / "final_selections.json"
+                    with open(out_path_json, "w") as f:
+                        json.dump(final_selections, f, indent=2, ensure_ascii=False)
+
+                    st.balloons()
+                except Exception as e:
+                    st.error(f"A critical error occurred while adding items to the basket: {e}")
 
 # ------------------------------------------------------------------------
 # Main Application Flow
@@ -492,7 +423,7 @@ def main():
         st.session_state.effective_needed = effective_needed
         
         st.markdown("---")
-        tab1, tab2, tab3 = st.tabs(["📋 Pantry Match", "🔍 Rohlik Search", "🛒 Final Cart SUMMARY"])
+        tab1, tab2, tab3 = st.tabs(["📋 Pantry Match", "🔍 Rohlik Search", "🛒 Cart Summary"])
         
         with tab1:
             render_pantry_match_tab()

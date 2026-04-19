@@ -43,7 +43,8 @@ class RohlikMCPAgent:
         self.instruction = (
             "You are an expert personal shopper for Rohlik.cz (Czech Republic). "
             "To find products, you MUST use the `batch_search_products` tool. "
-            "IMPORTANT: You must provide keywords in CZECH (e.g., 'máslo' instead of 'butter'). "
+            "Pass search keywords exactly as given — do NOT translate them. "
+            "The Rohlik search engine understands both Czech and English. "
             "Always return the 3 best options with prices and ensure the best price-to-quality ratio.\n\n"
             f"User preferences:\n{prefs}"
         )

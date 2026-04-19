@@ -313,7 +313,10 @@ def render_rohlik_search_tab():
             )
 
             def on_change_qty(ing=ing_key, key=f"qty_{i}"):
-                st.session_state.quantities[ing] = int(st.session_state[key])
+                try:
+                    st.session_state.quantities[ing] = int(st.session_state[key])
+                except (ValueError, TypeError):
+                    st.session_state.quantities[ing] = 1
 
             # Compute suggestion for the currently selected product (for display)
             cur_opt = options[current_idx] if current_idx < len(options) else {}
@@ -387,13 +390,15 @@ def render_cart_summary_tab():
                 "productId": int(prod_id),
                 "quantity": packs
             })
+        else:
+            skipped_items_final.append({"Ingredient": ing, "Reason": "Missing product ID — add manually"})
             
     try:
         total_price = sum(
-            float(str(sel.get('price', 0)).replace(',', '').replace('Kč', '').strip() or 0) * sel.get('packs', 1)
+            float(sel.get('price') or 0) * sel.get('packs', 1)
             for sel in final_selections
         )
-    except Exception:
+    except (ValueError, TypeError):
         total_price = 0.0
         
     st.markdown("#### Items to Buy")

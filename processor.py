@@ -24,6 +24,35 @@ def extract_text_from_pdf(pdf_source):
         print(f"Failed to read PDF source: {e}")
         return ""
 
+def _find_first_json_array(text: str) -> str | None:
+    """Return the first complete JSON array found in text, or None."""
+    start = text.find('[')
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape_next = False
+    for i, ch in enumerate(text[start:], start):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '[':
+            depth += 1
+        elif ch == ']':
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
 def extract_text_from_markdown(md_source) -> str:
     """
     Extracts recipe text from a markdown file.
@@ -53,6 +82,7 @@ def extract_text_from_markdown(md_source) -> str:
         match = re.search(r'##\s+Ingredients\s*\n(.*?)(?=\n##\s|\Z)', content, re.DOTALL | re.IGNORECASE)
         if match:
             return match.group(0).strip()
+        print("Warning: NYT recipe detected but no '## Ingredients' section found — using full content")
 
     return content
 
@@ -115,10 +145,10 @@ def parse_recipe_ingredients(recipe_text, api_key):
         pass
 
     # Fallback: find a JSON array anywhere in the response
-    match = re.search(r'\[.*\]', text_out, re.DOTALL)
-    if match:
+    candidate = _find_first_json_array(text_out)
+    if candidate:
         try:
-            return json.loads(match.group())
+            return json.loads(candidate)
         except json.JSONDecodeError:
             pass
 

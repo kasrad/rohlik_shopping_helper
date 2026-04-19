@@ -23,15 +23,42 @@ def _auto_suggest_quantity(ingredient_qty_str: str, package_size_str: str, produ
     Falls back to 1 for incompatible or unparseable units.
     """
     UNIT_FACTORS = {
+        # Metric weight
         'kg': 1000, 'kilogram': 1000, 'kilograms': 1000,
         'g': 1,     'gram': 1,        'grams': 1,
+        # Metric volume
         'l': 1000,  'liter': 1000,    'liters': 1000,  'litre': 1000,  'litres': 1000,
         'ml': 1,    'milliliter': 1,  'milliliters': 1, 'millilitre': 1, 'millilitres': 1,
+        # Imperial weight (converted to grams)
+        'lb': 453.592, 'lbs': 453.592, 'pound': 453.592, 'pounds': 453.592,
+        'oz': 28.3495, 'ounce': 28.3495, 'ounces': 28.3495,
+        # Imperial volume (converted to ml)
+        'cup': 240,   'cups': 240,
+        'tbsp': 15,   'tablespoon': 15,   'tablespoons': 15,
+        'tsp': 5,     'teaspoon': 5,      'teaspoons': 5,
+        'pint': 473.176, 'pints': 473.176,
+        'quart': 946.353, 'quarts': 946.353,
     }
-    WEIGHT_UNITS = {'kg', 'kilogram', 'kilograms', 'g', 'gram', 'grams'}
+    WEIGHT_UNITS = {
+        'kg', 'kilogram', 'kilograms', 'g', 'gram', 'grams',
+        'lb', 'lbs', 'pound', 'pounds', 'oz', 'ounce', 'ounces',
+    }
     TOLERANCE = 0.85
 
-    _unit_pat = r'(kilogram(?:s)?|kg|gram(?:s)?|g|millilitre(?:s)?|milliliter(?:s)?|ml|litre(?:s)?|liter(?:s)?|l)'
+    # Longer alternatives must come before shorter ones to avoid partial matches.
+    _unit_pat = (
+        r'(tablespoon(?:s)?|tbsp'
+        r'|teaspoon(?:s)?|tsp'
+        r'|pound(?:s)?|lbs?'
+        r'|ounce(?:s)?|oz'
+        r'|quart(?:s)?'
+        r'|pint(?:s)?'
+        r'|cup(?:s)?'
+        r'|kilogram(?:s)?|kg'
+        r'|gram(?:s)?|g'
+        r'|millilitre(?:s)?|milliliter(?:s)?|ml'
+        r'|litre(?:s)?|liter(?:s)?|l)'
+    )
 
     def parse_total(s: str):
         s = s.lower().replace(',', '.')

@@ -1,14 +1,14 @@
 import streamlit as st
 import os
+import subprocess
 import urllib.parse
 import json
-import concurrent.futures
 import pandas as pd
 from dotenv import load_dotenv
 
 from config import ENV_PATH, PANTRY_PATH, ROOT
 from processor import extract_text_from_pdf, extract_text_from_markdown, parse_recipe_ingredients, consolidate_ingredients
-from pantry import filter_pantry_items
+from pantry import filter_pantry_items, apply_search_preferences
 from shopping import fetch_item_from_rohlik, _auto_suggest_quantity
 from agents.mcp_agent import RohlikMCPAgent
 
@@ -164,25 +164,50 @@ def render_rohlik_search_tab():
         
         if st.button("Find Products on Rohlik.cz", use_container_width=True):
             shopping_list = []
-            
-            # Using st.status to prevent "ghosting" and keep UI clean
-            with st.status("🔍 Sourcing Products from Rohlik.cz...", expanded=True) as status:
-                total = len(needed)
-                progress_bar = st.progress(0, text=f"0 / {total} products fetched")
-                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                    futures = {executor.submit(fetch_item_from_rohlik, item): item for item in needed}
-                    for idx, future in enumerate(concurrent.futures.as_completed(futures)):
-                        item_failed = futures[future]
-                        try:
-                            result = future.result()
-                            shopping_list.append(result)
-                            st.write(f"✅ Fetched: {item_failed['name']}")
-                        except Exception as e:
-                            st.error(f"❌ Error fetching '{item_failed['name']}': {e}")
-                        progress_bar.progress((idx + 1) / total, text=f"{idx + 1} / {total} products fetched")
 
-                st.session_state.shopping_list = shopping_list
-                status.update(label=f"Sourced {len(shopping_list)} products!", state="complete", expanded=False)
+            # Prevent Mac from sleeping during the fetch
+            caffeinate = subprocess.Popen(["caffeinate", "-i"])
+            st.toast("☕ Keeping Mac awake during fetch", icon="☕")
+
+            try:
+                with st.status(f"☕ Fetching {len(needed)} products in one batch (Mac awake)...", expanded=True) as status:
+                    # Build Czech search term for each ingredient
+                    search_terms = {
+                        item['name']: apply_search_preferences(item['name'])
+                        for item in needed
+                    }
+
+                    st.write(f"Sending all {len(needed)} ingredients to Rohlik in a single request...")
+
+                    try:
+                        agent = RohlikMCPAgent()
+                        batch_results = agent.find_alternatives_batch(list(search_terms.values()))
+                    except Exception as e:
+                        st.error(f"❌ Batch fetch failed: {e}")
+                        status.update(label="Fetch failed", state="error")
+                        return
+
+                    # Assemble shopping list and show per-item result
+                    for item in needed:
+                        search_term = search_terms[item['name']]
+                        alternatives = batch_results.get(search_term, [])
+                        shopping_list.append({
+                            "ingredient": item['name'],
+                            "search_term": search_term,
+                            "quantity_needed": item['quantity'],
+                            "options": alternatives,
+                        })
+                        if alternatives:
+                            st.write(f"✅ {item['name']} — {len(alternatives)} option(s) found")
+                        else:
+                            st.warning(f"⚠️ {item['name']} — no results")
+
+                    st.session_state.shopping_list = shopping_list
+                    status.update(label=f"Fetched {len(shopping_list)} products!", state="complete", expanded=False)
+            finally:
+                # Always release the sleep lock when done or on error
+                caffeinate.terminate()
+                st.toast("Mac can sleep again", icon="🌙")
                 
             st.rerun()
 

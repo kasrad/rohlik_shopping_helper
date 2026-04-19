@@ -15,7 +15,7 @@ from agents.mcp_agent import RohlikMCPAgent
 # ------------------------------------------------------------------------
 # Initialization & Setup
 # ------------------------------------------------------------------------
-load_dotenv(ENV_PATH)
+load_dotenv(ENV_PATH, override=True)
 api_key = os.environ.get("ANTHROPIC_API_KEY")
 
 st.set_page_config(page_title="Rohlik Shopping Agent", page_icon="🛒", layout="wide")
@@ -45,7 +45,14 @@ def render_upload_section():
                 st.rerun()
     st.write("Upload up to 10 recipe files (PDF or Markdown) to generate a consolidated shopping list.")
 
-    uploaded_files = st.file_uploader("Choose recipe files", type=["pdf", "md"], accept_multiple_files=True)
+    # Accept PDFs and Markdown files. Markdown MIME type varies by OS/browser
+    # (text/markdown or text/plain), so we allow both and rely on the .md
+    # extension check in the processing loop to route correctly.
+    uploaded_files = st.file_uploader(
+        "Choose recipe files",
+        type=["pdf", "text/markdown", "text/plain", "md"],
+        accept_multiple_files=True,
+    )
 
     # Persistent summary display to keep the widget tree stable
     if st.session_state.extraction_summary:

@@ -7,7 +7,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from config import ENV_PATH, PANTRY_PATH, ROOT
-from processor import extract_text_from_pdf, parse_recipe_ingredients, consolidate_ingredients
+from processor import extract_text_from_pdf, extract_text_from_markdown, parse_recipe_ingredients, consolidate_ingredients
 from pantry import filter_pantry_items
 from shopping import fetch_item_from_rohlik, _auto_suggest_quantity
 from agents.mcp_agent import RohlikMCPAgent
@@ -31,7 +31,7 @@ if 'quantities' not in st.session_state:
 # ------------------------------------------------------------------------
 
 def render_upload_section():
-    """Handles PDF file uploads and processes them to extract ingredients."""
+    """Handles recipe file uploads (PDF or .md) and processes them to extract ingredients."""
     col_title, col_reset = st.columns([6, 1])
     with col_title:
         st.title("🛒 Rohlik Shopping Agent")
@@ -43,9 +43,9 @@ def render_upload_section():
                             'selections', 'quantities', 'extraction_summary', 'effective_needed']:
                     st.session_state.pop(key, None)
                 st.rerun()
-    st.write("Upload up to 10 recipe PDFs to generate a consolidated shopping list.")
+    st.write("Upload up to 10 recipe files (PDF or Markdown) to generate a consolidated shopping list.")
 
-    uploaded_files = st.file_uploader("Choose PDF files", type="pdf", accept_multiple_files=True)
+    uploaded_files = st.file_uploader("Choose recipe files", type=["pdf", "md"], accept_multiple_files=True)
 
     # Persistent summary display to keep the widget tree stable
     if st.session_state.extraction_summary:
@@ -64,7 +64,10 @@ def render_upload_section():
                 for i, uploaded_file in enumerate(uploaded_files):
                     st.write(f"Reading: **{uploaded_file.name}**...")
                     try:
-                        text = extract_text_from_pdf(uploaded_file)
+                        if uploaded_file.name.lower().endswith(".md"):
+                            text = extract_text_from_markdown(uploaded_file)
+                        else:
+                            text = extract_text_from_pdf(uploaded_file)
                         ingredients = parse_recipe_ingredients(text, api_key)
                         if ingredients:
                             all_recipe_ingredients.append(ingredients)
@@ -97,7 +100,7 @@ def render_upload_section():
                     st.error("No ingredients could be parsed from the uploaded files.")
                     status.update(label="Processing failed", state="error")
     else:
-        st.info("Please upload at least one PDF recipe to get started.")
+        st.info("Please upload at least one recipe file (PDF or Markdown) to get started.")
 
 def render_pantry_match_tab():
     st.subheader("🧐 Pantry Match")

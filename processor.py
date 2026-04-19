@@ -1,3 +1,4 @@
+import io
 import json
 import re
 from pypdf import PdfReader
@@ -23,20 +24,53 @@ def extract_text_from_pdf(pdf_source):
         print(f"Failed to read PDF source: {e}")
         return ""
 
+def extract_text_from_markdown(md_source) -> str:
+    """
+    Extracts recipe text from a markdown file.
+
+    For NYT Cooking recipes (source contains cooking.nytimes.com), only the
+    ## Ingredients section is returned to minimise token usage.
+
+    Args:
+        md_source: A file path, file-like object, or string with markdown content.
+
+    Returns:
+        A string with the relevant recipe text.
+    """
+    if isinstance(md_source, str):
+        content = md_source
+    elif isinstance(md_source, (bytes, bytearray)):
+        content = md_source.decode("utf-8")
+    else:
+        raw = md_source.read()
+        content = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
+
+    # Detect NYT Cooking source from YAML frontmatter
+    is_nyt = bool(re.search(r'^source:\s*["\']?https?://cooking\.nytimes\.com', content, re.MULTILINE | re.IGNORECASE))
+
+    if is_nyt:
+        # Extract only the Ingredients section (up to next ## heading or end of file)
+        match = re.search(r'##\s+Ingredients\s*\n(.*?)(?=\n##\s|\Z)', content, re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(0).strip()
+
+    return content
+
+
 def parse_recipe_ingredients(recipe_text, api_key):
     """
-    Uses the Gemini LLM to parse raw recipe text into a structured JSON list of ingredients.
+    Uses Claude to parse raw recipe text into a structured JSON list of ingredients.
 
     Args:
         recipe_text (str): The raw text extracted from a recipe document.
-        api_key (str): The API key for Gemini.
+        api_key (str): The Anthropic API key.
 
     Returns:
         list: A list of dicts, each with 'name' and 'quantity' keys.
 
     Raises:
-        ValueError: If the PDF appears to contain no extractable text.
-        RuntimeError: If the Gemini API call or JSON parsing fails.
+        ValueError: If the source appears to contain no extractable text.
+        RuntimeError: If the Claude API call or JSON parsing fails.
     """
     if not recipe_text or not recipe_text.strip():
         raise ValueError(
@@ -89,7 +123,7 @@ def parse_recipe_ingredients(recipe_text, api_key):
             pass
 
     raise RuntimeError(
-        f"Could not parse Gemini response as JSON.\nResponse was: {text_out[:300]}"
+        f"Could not parse Claude response as JSON.\nResponse was: {text_out[:300]}"
     )
 
 def consolidate_ingredients(recipe_ingredient_lists):

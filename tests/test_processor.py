@@ -1,5 +1,5 @@
-"""Tests for processor.py — covers _find_first_json_array, extract_text_from_markdown,
-consolidate_ingredients, and parse_recipe_ingredients (with mocked Claude)."""
+"""Tests for processor.py — covers _find_first_json_array, extract_text_from_pdf,
+extract_text_from_markdown, consolidate_ingredients, and parse_recipe_ingredients."""
 
 import json
 from unittest.mock import MagicMock, patch
@@ -10,8 +10,67 @@ from processor import (
     _find_first_json_array,
     consolidate_ingredients,
     extract_text_from_markdown,
+    extract_text_from_pdf,
     parse_recipe_ingredients,
 )
+
+
+# ---------------------------------------------------------------------------
+# extract_text_from_pdf
+# ---------------------------------------------------------------------------
+
+
+class TestExtractTextFromPdf:
+    def _make_reader(self, page_texts):
+        pages = []
+        for text in page_texts:
+            page = MagicMock()
+            page.extract_text.return_value = text
+            pages.append(page)
+        reader = MagicMock()
+        reader.pages = pages
+        return reader
+
+    def test_single_page_text_returned(self):
+        reader = self._make_reader(["Ingredients: 2 eggs"])
+        with patch("processor.PdfReader", return_value=reader):
+            result = extract_text_from_pdf("fake.pdf")
+        assert "Ingredients: 2 eggs" in result
+
+    def test_multiple_pages_concatenated(self):
+        reader = self._make_reader(["Page 1 text", "Page 2 text"])
+        with patch("processor.PdfReader", return_value=reader):
+            result = extract_text_from_pdf("fake.pdf")
+        assert "Page 1 text" in result
+        assert "Page 2 text" in result
+
+    def test_empty_pdf_returns_empty_string(self):
+        reader = MagicMock()
+        reader.pages = []
+        with patch("processor.PdfReader", return_value=reader):
+            result = extract_text_from_pdf("fake.pdf")
+        assert result == ""
+
+    def test_malformed_pdf_returns_empty_string(self):
+        with patch("processor.PdfReader", side_effect=Exception("Malformed PDF")):
+            result = extract_text_from_pdf("bad.pdf")
+        assert result == ""
+
+    def test_pages_separated_by_newline(self):
+        reader = self._make_reader(["Page 1", "Page 2"])
+        with patch("processor.PdfReader", return_value=reader):
+            result = extract_text_from_pdf("fake.pdf")
+        # Each page ends with "\n" per the implementation
+        assert "Page 1\n" in result
+        assert "Page 2\n" in result
+
+    def test_accepts_file_like_object(self):
+        import io
+        buf = io.BytesIO(b"fake pdf bytes")
+        reader = self._make_reader(["recipe text"])
+        with patch("processor.PdfReader", return_value=reader) as mock_cls:
+            extract_text_from_pdf(buf)
+        mock_cls.assert_called_once_with(buf)
 
 
 # ---------------------------------------------------------------------------

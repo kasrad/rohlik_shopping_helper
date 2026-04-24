@@ -3,7 +3,8 @@
     "allow": [
       "Read(/**)",
       "Edit(/**)",
-      "Write(/**)"
+      "Write(/**)",
+      "Bash"
     ],
     "ask": [
       "Read(/.env)",
